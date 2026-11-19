@@ -4,6 +4,7 @@ import { requireAuth } from '../middleware/auth.js';
 import multer from 'multer';
 import path from 'path';
 import { extractText, ALLOWED_EXT } from '../lib/extractText.js';
+import crypto from 'crypto';
 
 const router = Router();
 const MAX_CONTENT = 300000;
@@ -192,6 +193,91 @@ router.delete(
       return res.status(404).json({ message: 'Dokumen tidak ditemukan' });
     }
     res.json({ message: 'Dokumen dihapus' });
+  })
+);
+
+function requireGuru(req, res, next) {
+  if (req.user.role !== 'guru') {
+    return res.status(403).json({ message: 'Hanya guru yang bisa membagikan materi' });
+  }
+  next();
+}
+
+async function ownsDocument(documentId, userId) {
+  const result = await pool.query(
+    'SELECT id FROM documents WHERE id = $1 AND user_id = $2',
+    [documentId, userId]
+  );
+  return Boolean(result.rows[0]);
+}
+
+async function activeLink(documentId) {
+  const result = await pool.query(
+    'SELECT token, created_at FROM shared_links WHERE document_id = $1 AND revoked_at IS NULL',
+    [documentId]
+  );
+  return result.rows[0] || null;
+}
+
+// lihat tautan aktif sebuah dokumen (null kalau belum ada)
+router.get(
+  '/:id/share',
+  handle(async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ message: 'ID tidak valid' });
+    if (!(await ownsDocument(id, req.user.id))) {
+      return res.status(404).json({ message: 'Dokumen tidak ditemukan' });
+    }
+    res.json({ link: await activeLink(id) });
+  })
+);
+
+// buat tautan berbagi (kalau sudah ada yang aktif, kirim yang itu)
+router.post(
+  '/:id/share',
+  requireGuru,
+  handle(async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ message: 'ID tidak valid' });
+    if (!(await ownsDocument(id, req.user.id))) {
+      return res.status(404).json({ message: 'Dokumen tidak ditemukan' });
+    }
+
+    const token = crypto.randomBytes(16).toString('base64url');
+    const inserted = await pool.query(
+      `INSERT INTO shared_links (document_id, token)
+       VALUES ($1, $2)
+       ON CONFLICT (document_id) WHERE revoked_at IS NULL DO NOTHING
+       RETURNING token, created_at`,
+      [id, token]
+    );
+    if (inserted.rows[0]) {
+      return res.status(201).json({ link: inserted.rows[0] });
+    }
+    res.json({ link: await activeLink(id) });
+  })
+);
+
+// cabut tautan aktif
+router.delete(
+  '/:id/share',
+  handle(async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ message: 'ID tidak valid' });
+    if (!(await ownsDocument(id, req.user.id))) {
+      return res.status(404).json({ message: 'Dokumen tidak ditemukan' });
+    }
+
+    const result = await pool.query(
+      `UPDATE shared_links SET revoked_at = NOW()
+       WHERE document_id = $1 AND revoked_at IS NULL
+       RETURNING id`,
+      [id]
+    );
+    if (!result.rows[0]) {
+      return res.status(404).json({ message: 'Tidak ada tautan aktif' });
+    }
+    res.json({ message: 'Tautan dicabut' });
   })
 );
 
