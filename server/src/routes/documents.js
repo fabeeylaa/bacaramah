@@ -1,9 +1,28 @@
 import { Router } from 'express';
 import { pool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import multer from 'multer';
+import path from 'path';
+import { extractText, ALLOWED_EXT } from '../lib/extractText.js';
 
 const router = Router();
 const MAX_CONTENT = 300000;
+const MAX_FILE_MB = 5;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 1 },
+});
+
+function receiveFile(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ message: `Ukuran file maksimal ${MAX_FILE_MB} MB` });
+    }
+    return res.status(400).json({ message: 'File gagal diunggah' });
+  });
+}
 
 router.use(requireAuth);
 
@@ -62,6 +81,57 @@ router.post(
       [req.user.id, data.title, data.content]
     );
     res.status(201).json({ document: result.rows[0] });
+  })
+);
+
+// unggah PDF/DOCX, ambil teksnya, simpan sebagai dokumen
+router.post(
+  '/import',
+  receiveFile,
+  handle(async (req, res) => {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: 'Pilih file PDF atau DOCX dulu' });
+    }
+
+    // nama file dari multer bisa terbaca sebagai latin1, kembalikan ke UTF-8
+    const originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
+    const ext = path.extname(originalname).toLowerCase();
+    if (!ALLOWED_EXT.includes(ext)) {
+      return res.status(400).json({ message: 'Hanya file PDF atau DOCX yang bisa diunggah' });
+    }
+
+    let result;
+    try {
+      result = await extractText({ originalname, buffer: file.buffer });
+    } catch {
+      return res.status(422).json({
+        message: 'File tidak bisa dibaca. Pastikan file tidak rusak atau diproteksi.',
+      });
+    }
+
+    if (!result.text) {
+      return res.status(422).json({
+        message:
+          'Tidak ada teks yang bisa dibaca. Kalau file ini hasil scan atau foto, coba tempel teksnya langsung.',
+      });
+    }
+    if (result.text.length > MAX_CONTENT) {
+      return res.status(413).json({
+        message: `Teks terlalu panjang (maksimal ${MAX_CONTENT} karakter)`,
+      });
+    }
+
+    const typedTitle = typeof req.body.title === 'string' ? req.body.title.trim() : '';
+    const title = (typedTitle || path.basename(originalname, ext)).slice(0, 200);
+
+    const saved = await pool.query(
+      `INSERT INTO documents (user_id, title, content, source)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [req.user.id, title, result.text, result.source]
+    );
+    res.status(201).json({ document: saved.rows[0] });
   })
 );
 
