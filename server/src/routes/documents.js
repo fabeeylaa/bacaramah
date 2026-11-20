@@ -58,10 +58,20 @@ router.get(
   '/',
   handle(async (req, res) => {
     const result = await pool.query(
-      `SELECT id, title, source, created_at, updated_at, LEFT(content, 150) AS preview
-       FROM documents
-       WHERE user_id = $1
-       ORDER BY created_at DESC`,
+            `SELECT d.id, d.title, d.source, d.created_at, d.updated_at,
+              LEFT(d.content, 150) AS preview,
+              (SELECT s.token FROM shared_links s
+               WHERE s.document_id = d.id AND s.revoked_at IS NULL) AS share_token,
+              CASE
+                WHEN EXISTS (SELECT 1 FROM shared_links s
+                             WHERE s.document_id = d.id AND s.revoked_at IS NULL) THEN 'aktif'
+                WHEN EXISTS (SELECT 1 FROM shared_links s
+                             WHERE s.document_id = d.id) THEN 'dicabut'
+                ELSE 'belum'
+              END AS share_status
+       FROM documents d
+       WHERE d.user_id = $1
+       ORDER BY d.created_at DESC`,
       [req.user.id]
     );
     res.json({ documents: result.rows });
